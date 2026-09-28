@@ -1,0 +1,95 @@
+// uart_driver.cpp
+// Драйвер UART для ARM Cortex-M: кольцевые буферы + прерывания.
+// Сборка: arm-none-eabi-g++ -std=c++17 -Os -fno-exceptions -fno-rtti uart_driver.cpp -o uart.elf
+
+#include <cstdint>
+#include <cstddef>
+#include <atomic>
+
+// ================= RingBuffer (SPSC, lock-free) =================
+template <std::size_t N>
+class RingBuffer {
+    static_assert((N & (N - 1)) == 0, "N must be power of two");
+public:
+    bool push(std::uint8_t b) {
+        auto h = head_.load(std::memory_order_relaxed);
+        auto n = (h + 1) & (N - 1);
+        if (n == tail_.load(std::memory_order_acquire)) return false;
+        buf_[h] = b;
+        head_.store(n, std::memory_order_release);
+        return true;
+    }
+    bool pop(std::uint8_t& out) {
+        auto t = tail_.load(std::memory_order_relaxed);
+        if (t == head_.load(std::memory_order_acquire)) return false;
+        out = buf_[t];
+        tail_.store((t + 1) & (N - 1), std::memory_order_release);
+        return true;
+    }
+private:
+    std::uint8_t buf_[N]{};
+    std::atomic<std::uint32_t> head_{0}, tail_{0};
+};
+
+// ================= UART driver =================
+class Uart {
+public:
+    explicit Uart(std::uint32_t base) : base_(base) {}
+
+    void init(std::uint32_t baud, std::uint32_t pclk) {
+        *reg(CR1) = 0;
+        *reg(BRR) = pclk / baud;
+        *reg(CR1) = UE | TE | RE | RXNEIE;
+    }
+
+    void write(const char* s) {
+        while (*s) tx_.push(static_cast<std::uint8_t>(*s++));
+        *reg(CR1) |= TXEIE;
+    }
+
+    // Вызывать в основном цикле
+    void poll() {
+        std::uint8_t b;
+        while (rx_.pop(b)) {
+            tx_.push(b);          // эхо
+            *reg(CR1) |= TXEIE;
+        }
+    }
+
+    // Вызывать из обработчика прерывания
+    void isr() {
+        const std::uint32_t st = *reg(ISR);
+        if (st & RXNE) rx_.push(static_cast<std::uint8_t>(*reg(RDR)));
+        if (st & TXE) {
+            std::uint8_t b;
+            if (tx_.pop(b)) *reg(TDR) = b;
+            else            *reg(CR1) &= ~TXEIE;
+        }
+    }
+
+private:
+    static constexpr std::size_t BUF = 128;
+    static constexpr std::uint32_t CR1 = 0x00, BRR = 0x08, ISR = 0x1C;
+    static constexpr std::uint32_t RDR = 0x24, TDR = 0x28;
+    static constexpr std::uint32_t UE = 1u<<0, RE = 1u<<2, TE = 1u<<3;
+    static constexpr std::uint32_t RXNEIE = 1u<<5, TXEIE = 1u<<7;
+    static constexpr std::uint32_t RXNE = 1u<<5, TXE = 1u<<7;
+
+    std::uint32_t base_;
+    RingBuffer<BUF> rx_, tx_;
+
+    volatile std::uint32_t* reg(std::uint32_t off) const {
+        return reinterpret_cast<volatile std::uint32_t*>(base_ + off);
+    }
+};
+
+// ================= Применение =================
+static Uart uart(0x40013800);   // USART1 на STM32F4
+
+int main() {
+    uart.init(115200, 16'000'000);
+    uart.write("UART ready\r\n");
+    for (;;) uart.poll();
+}
+
+extern "C" void USART1_IRQHandler() { uart.isr(); }
